@@ -54,9 +54,20 @@ func NewTerraformPluginFrameworkAsyncConnector(kube client.Client,
 	return nfac
 }
 
-func (c *TerraformPluginFrameworkAsyncConnector) Connect(ctx context.Context, mg xpresource.Managed) (managed.ExternalClient, error) {
-	ec, err := c.TerraformPluginFrameworkConnector.Connect(ctx, mg)
+func (c *TerraformPluginFrameworkAsyncConnector) Connect(_ context.Context, mg xpresource.Managed) (managed.ExternalClient, error) { //nolint:contextcheck // async operations must not inherit the short-lived reconciliation context
+	// Use a fresh context with defaultAsyncTimeout instead of the reconciliation
+	// context (~3 min). Some providers (e.g. GCP) store the context passed to
+	// SetupFn inside their provider configuration and reuse it for every
+	// subsequent API call. Async goroutines live for up to 1 hour, so inheriting
+	// the reconciliation context causes provider API calls to be aborted when
+	// that deadline expires.
+	// Using context.WithTimeout (not context.WithoutCancel) ensures
+	// ctx.Done() is non-nil, preventing goroutine leaks in provider code that
+	// selects on ctx.Done() (e.g. GCP's request batcher).
+	asyncCtx, asyncCancel := context.WithTimeout(context.Background(), defaultAsyncTimeout)
+	ec, err := c.TerraformPluginFrameworkConnector.Connect(asyncCtx, mg)
 	if err != nil {
+		asyncCancel()
 		return nil, errors.Wrap(err, "cannot initialize the Terraform Plugin Framework async external client")
 	}
 
@@ -64,6 +75,7 @@ func (c *TerraformPluginFrameworkAsyncConnector) Connect(ctx context.Context, mg
 		terraformPluginFrameworkExternalClient: ec.(*terraformPluginFrameworkExternalClient),
 		callback:                               c.callback,
 		eventHandler:                           c.eventHandler,
+		asyncCancel:                            asyncCancel,
 	}, nil
 }
 
@@ -111,6 +123,7 @@ type terraformPluginFrameworkAsyncExternalClient struct {
 	*terraformPluginFrameworkExternalClient
 	callback     CallbackProvider
 	eventHandler *handler.EventHandler
+	asyncCancel  context.CancelFunc
 }
 
 func (n *terraformPluginFrameworkAsyncExternalClient) Observe(ctx context.Context, mg xpresource.Managed) (managed.ExternalObservation, error) {
@@ -230,6 +243,7 @@ func (n *terraformPluginFrameworkAsyncExternalClient) Create(_ context.Context, 
 			if cErr := n.callback.Create(name)(err, ctx); cErr != nil {
 				n.opTracker.logger.Info("Async create callback failed", "error", cErr.Error())
 			}
+			n.asyncCancel()
 		}()
 		defer ph.recoverIfPanic(ctx)
 
@@ -267,6 +281,7 @@ func (n *terraformPluginFrameworkAsyncExternalClient) Update(_ context.Context, 
 			if cErr := n.callback.Update(name)(err, ctx); cErr != nil {
 				n.opTracker.logger.Info("Async update callback failed", "error", cErr.Error())
 			}
+			n.asyncCancel()
 		}()
 		defer ph.recoverIfPanic(ctx)
 
@@ -308,6 +323,7 @@ func (n *terraformPluginFrameworkAsyncExternalClient) Delete(_ context.Context, 
 			if cErr := n.callback.Destroy(name)(err, ctx); cErr != nil {
 				n.opTracker.logger.Info("Async delete callback failed", "error", cErr.Error())
 			}
+			n.asyncCancel()
 		}()
 		defer ph.recoverIfPanic(ctx)
 
@@ -319,5 +335,11 @@ func (n *terraformPluginFrameworkAsyncExternalClient) Delete(_ context.Context, 
 }
 
 func (n *terraformPluginFrameworkAsyncExternalClient) Disconnect(_ context.Context) error {
+	// Cancel the async context if no async operation is currently running.
+	// If an operation IS running, the goroutine's finishing operations will
+	// call asyncCancel when it completes.
+	if !n.opTracker.LastOperation.IsRunning() {
+		n.asyncCancel()
+	}
 	return nil
 }

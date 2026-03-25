@@ -95,7 +95,8 @@ func prepareTerraformPluginSDKAsyncExternal(r Resource, cfg *config.Resource, fn
 			logger:    logTest,
 			opTracker: NewAsyncTracker(),
 		},
-		callback: fns,
+		callback:    fns,
+		asyncCancel: func() {}, // no-op cancel for tests that build the struct directly
 	}
 }
 
@@ -123,13 +124,81 @@ func TestAsyncTerraformPluginSDKConnect(t *testing.T) {
 				ots: ots,
 			},
 		},
+		// Verifies that the context passed to SetupFn is independent of the
+		// reconciliation context. Canceling the reconciliation context must not
+		// affect the async context stored inside ts.Meta by the provider.
+		"SetupFnReceivesContextIndependentOfReconciliationContext": {
+			args: args{
+				setupFn: func(ctx context.Context, _ client.Client, _ xpresource.Managed) (terraform.Setup, error) {
+					// The context received here must not be derived from the
+					// reconciliation context. We verify this by checking that
+					// the context has a deadline (from defaultAsyncTimeout) and
+					// is not already canceled.
+					if err := ctx.Err(); err != nil {
+						return terraform.Setup{}, err
+					}
+					if _, ok := ctx.Deadline(); !ok {
+						t.Error("setupFn: expected a context with a deadline (defaultAsyncTimeout), got none")
+					}
+					return terraform.Setup{}, nil
+				},
+				cfg: cfgAsync,
+				obj: objAsync,
+				ots: ots,
+			},
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
+			reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
+			// Cancel the reconciliation context before Connect returns to
+			// simulate a short-lived reconciliation deadline expiring.
+			reconcileCancel()
+
 			c := NewTerraformPluginSDKAsyncConnector(nil, tc.args.ots, tc.args.setupFn, tc.args.cfg, WithTerraformPluginSDKAsyncLogger(logTest))
-			_, err := c.Connect(context.TODO(), tc.args.obj)
+			_, err := c.Connect(reconcileCtx, tc.args.obj)
 			if diff := cmp.Diff(tc.want.err, err, test.EquateErrors()); diff != "" {
 				t.Errorf("\n%s\nConnect(...): -want error, +got error:\n", diff)
+			}
+		})
+	}
+}
+
+func TestAsyncTerraformPluginSDKDisconnect(t *testing.T) {
+	type args struct {
+		operationRunning bool
+	}
+	type want struct {
+		cancelCalled bool
+		err          error
+	}
+	cases := map[string]struct {
+		args
+		want
+	}{
+		"CancelsAsyncContextWhenNoOperationRunning": {
+			args: args{operationRunning: false},
+			want: want{cancelCalled: true},
+		},
+		"DoesNotCancelAsyncContextWhenOperationRunning": {
+			args: args{operationRunning: true},
+			want: want{cancelCalled: false},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			cancelCalled := false
+			e := prepareTerraformPluginSDKAsyncExternal(mockResource{}, cfgAsync, CallbackFns{})
+			e.asyncCancel = func() { cancelCalled = true }
+			if tc.args.operationRunning {
+				e.opTracker.LastOperation.MarkStart("create")
+			}
+			err := e.Disconnect(context.TODO())
+			if diff := cmp.Diff(tc.want.err, err, test.EquateErrors()); diff != "" {
+				t.Errorf("\n%s\nDisconnect(...): -want error, +got error:\n", diff)
+			}
+			if cancelCalled != tc.want.cancelCalled {
+				t.Errorf("Disconnect(...): asyncCancel called = %v, want %v", cancelCalled, tc.want.cancelCalled)
 			}
 		})
 	}

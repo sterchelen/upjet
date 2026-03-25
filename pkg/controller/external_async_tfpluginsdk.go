@@ -52,9 +52,20 @@ func NewTerraformPluginSDKAsyncConnector(kube client.Client, ots *OperationTrack
 	return nfac
 }
 
-func (c *TerraformPluginSDKAsyncConnector) Connect(ctx context.Context, mg xpresource.Managed) (managed.ExternalClient, error) {
-	ec, err := c.TerraformPluginSDKConnector.Connect(ctx, mg)
+func (c *TerraformPluginSDKAsyncConnector) Connect(_ context.Context, mg xpresource.Managed) (managed.ExternalClient, error) { //nolint:contextcheck // async operations must not inherit the short-lived reconciliation context
+	// Use a fresh context with defaultAsyncTimeout instead of the reconciliation
+	// context (~3 min). Some providers (e.g. GCP) store the context passed to
+	// SetupFn inside their provider configuration (ts.Meta) and reuse it for
+	// every subsequent API call. Async goroutines live for up to 1 hour, so
+	// inheriting the reconciliation context causes provider API calls to be
+	// aborted when that deadline expires.
+	// Using context.WithTimeout (not context.WithoutCancel) ensures
+	// ctx.Done() is non-nil, preventing goroutine leaks in provider code that
+	// selects on ctx.Done() (e.g. GCP's request batcher).
+	asyncCtx, asyncCancel := context.WithTimeout(context.Background(), defaultAsyncTimeout)
+	ec, err := c.TerraformPluginSDKConnector.Connect(asyncCtx, mg)
 	if err != nil {
+		asyncCancel()
 		return nil, errors.Wrap(err, "cannot initialize the Terraform plugin SDK async external client")
 	}
 
@@ -62,6 +73,7 @@ func (c *TerraformPluginSDKAsyncConnector) Connect(ctx context.Context, mg xpres
 		terraformPluginSDKExternal: ec.(*terraformPluginSDKExternal),
 		callback:                   c.callback,
 		eventHandler:               c.eventHandler,
+		asyncCancel:                asyncCancel,
 	}, nil
 }
 
@@ -111,6 +123,7 @@ type terraformPluginSDKAsyncExternal struct {
 	*terraformPluginSDKExternal
 	callback     CallbackProvider
 	eventHandler *handler.EventHandler
+	asyncCancel  context.CancelFunc
 }
 
 type CallbackFn func(error, context.Context) error
@@ -164,6 +177,7 @@ func (n *terraformPluginSDKAsyncExternal) Create(_ context.Context, mg xpresourc
 			if cErr := n.callback.Create(name)(err, ctx); cErr != nil {
 				n.opTracker.logger.Info("Async create callback failed", "error", cErr.Error())
 			}
+			n.asyncCancel()
 		}()
 		defer ph.recoverIfPanic(ctx)
 
@@ -201,6 +215,7 @@ func (n *terraformPluginSDKAsyncExternal) Update(_ context.Context, mg xpresourc
 			if cErr := n.callback.Update(name)(err, ctx); cErr != nil {
 				n.opTracker.logger.Info("Async update callback failed", "error", cErr.Error())
 			}
+			n.asyncCancel()
 		}()
 		defer ph.recoverIfPanic(ctx)
 
@@ -242,6 +257,7 @@ func (n *terraformPluginSDKAsyncExternal) Delete(_ context.Context, mg xpresourc
 			if cErr := n.callback.Destroy(name)(err, ctx); cErr != nil {
 				n.opTracker.logger.Info("Async delete callback failed", "error", cErr.Error())
 			}
+			n.asyncCancel()
 		}()
 		defer ph.recoverIfPanic(ctx)
 
@@ -253,5 +269,11 @@ func (n *terraformPluginSDKAsyncExternal) Delete(_ context.Context, mg xpresourc
 }
 
 func (n *terraformPluginSDKAsyncExternal) Disconnect(_ context.Context) error {
+	// Cancel the async context if no async operation is currently running.
+	// If an operation IS running, the goroutine's finishing operations will
+	// call asyncCancel when it completes.
+	if !n.opTracker.LastOperation.IsRunning() {
+		n.asyncCancel()
+	}
 	return nil
 }
